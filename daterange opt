@@ -1,0 +1,357 @@
+#########################################
+##### CPP Table Creater             ####
+#######################################
+
+### Description:  This function takes a data frame and an argument for data type
+###               (MOTO, counterfeit, pin, na_mid, atm) and returns the CPPs for
+###               that data set given the appropriate data type.
+
+### Variables:
+###  OVER 9000
+
+library(data.table)
+
+
+
+cpp_table <- function(x, data_type = NULL) {
+
+txn_data <- setDT(x)
+
+### Convert data types
+txn_data$Date <- as.Date(txn_data$Date)
+
+## some retl IDs have multiple MCCs - fix this ================================
+
+mult_MCC <- txn_data[, .(n_mccs = uniqueN(MCC)), by = Merchant_ID][n_mccs > 1]
+
+## exlude gas MIDs - need to differentiate
+gas_MID <- unique(txn_data[MCC %in% c("5541", "5542"), Merchant_ID])
+
+## get list of mids whos MCCS need changed - exclude gas
+mult_mcc_IDS <- unique(mult_MCC[!(Merchant_ID %in% gas_MID), Merchant_ID])
+
+txn_data$MCC[txn_data$Merchant_ID %in% mult_mcc_IDS] <- "MULTIPLE"
+
+### Step 1: Create CPP Table using data.table
+if (data_type == "atm"){
+
+  atm_data <- txn_data
+
+  cpp_table <- setDT(atm_data)[,n_total_cards_CPP := uniqueN(Card_Number),
+                               ][,.(n_cards = uniqueN(Card_Number),
+                                    n_txns = .N)
+                                 ,by = .(Terminal, n_total_cards_CPP, MCC)
+                                 ][n_cards > 1][order(-n_cards)]
+
+  cpp_table <- setcolorder(cpp_table, c("Terminal",'MCC', "n_cards", 'n_total_cards_CPP', 'n_txns'))
+
+
+} else if (data_type == "pin" || data_type == "counterfeit"){
+
+  mid_data <- txn_data
+
+  cpp_table <- setDT(mid_data)[,n_total_cards_CPP := uniqueN(Card_Number),
+                               ]
+
+  cpp_table <- cpp_table[,.(n_cards = uniqueN(Card_Number),
+                                    n_txns = .N)
+                                 ,
+                         by = .(Merchant_ID, n_total_cards_CPP, MCC)
+                         ]
+
+  cpp_table <- cpp_table[n_cards > 1]
+
+  cpp_table <- cpp_table[order(-n_cards)]
+
+
+  cpp_table <- setcolorder(cpp_table, c("Merchant_ID", 'MCC', "n_cards", 'n_total_cards_CPP', 'n_txns'))
+  } else {
+
+  namid_data <- txn_data
+
+  cpp_table <- setDT(namid_data)[,n_total_cards_CPP := uniqueN(Card_Number),
+                                 ][,.(n_cards = uniqueN(Card_Number),
+                                      n_txns = .N)
+                                   ,by = .(Terminal, n_total_cards_CPP, MCC)
+                                   ][n_cards > 1][order(-n_cards)]
+
+  cpp_table <- setcolorder(cpp_table, c("Terminal",'MCC', "n_cards", 'n_total_cards_CPP', 'n_txns'))
+  }
+
+## save dimensions to object dim
+dim <- dim(cpp_table)
+
+## terminate function if CPP table is empty
+if(0 %in% dim){
+  stop('There are no CPPs for this data set')
+}
+
+
+if(data_type %in%  c("counterfeit", "pin")){
+
+  cpp_table$loop_id <- 1:length(cpp_table$Merchant_ID)
+
+  keep <- c("Merchant_ID", "MCC", "loop_id")
+
+  loop_id_lu <- cpp_table[,..keep]
+
+  ## sub only MIDs in loop ID lu
+  txn_data_sub <- txn_data[Merchant_ID %in% cpp_table$Merchant_ID]
+
+  ## join data
+  setkey(txn_data_sub, Merchant_ID, MCC)
+  setkey(loop_id_lu, Merchant_ID, MCC)
+
+  txn_data_sub <- loop_id_lu[txn_data_sub]
+
+} else if(data_type %in% c("na_mid", "atm")){
+
+  cpp_table$loop_id <- 1:length(cpp_table$Terminal)
+
+  keep <- c("Terminal", "MCC", "loop_id")
+
+  loop_id_lu <- cpp_table[,..keep]
+
+  ## sub only MIDs in loop ID lu
+  txn_data_sub <- txn_data[Terminal %in% cpp_table$Terminal]
+
+  ## join data
+  setkey(txn_data_sub, Terminal, MCC)
+  setkey(loop_id_lu, Terminal, MCC)
+
+  txn_data_sub <- loop_id_lu[txn_data_sub]
+}
+
+## create empty data frame for optimized date range
+
+txn_data_sub$Date <- as.Date(txn_data_sub$Date)
+
+optimized <- matrix(nrow = length(cpp_table$MCC), ncol = 3)
+
+num_merchants <- length(cpp_table$MCC)
+
+txn_data_sub <- setDT(as.data.frame(txn_data_sub[!is.na(txn_data_sub$loop_id)]))
+
+
+### Initiate for loop
+suppressWarnings(
+
+# intital for loop iterates through each row (merchant) of CPP table
+for(i in 1:num_merchants){
+
+
+  ## Subset data, arranged by date
+  all_txns <- txn_data_sub[txn_data_sub$loop_id == i]
+
+  ## if n_txns = n_cards then optimized min/max == min max of subset
+  if(cpp_table[loop_id == i, n_cards] == cpp_table[loop_id == i, n_txns]){
+
+
+    #min date
+    optimized[i, 1] <- as.character(min(all_txns$Date))
+
+    #max date
+    optimized[i, 2] <- as.character(max(all_txns$Date))
+
+    #date range
+    optimized[i, 3] <-as.numeric(difftime(max(all_txns$Date),min(all_txns$Date), c("days")))
+
+  } else {
+
+      ## count cards in DF for given merchant
+      total_cards <- length(unique(all_txns$Card_Number))
+      n_cards <- length(unique(all_txns$Card_Number))
+
+      ## Set max date
+      min_date <- min(all_txns$Date)
+      new_min <- min(all_txns$Date)
+
+      max_date <- max(all_txns$Date)
+      new_max <- max(all_txns$Date)
+
+      ## calc txns per card
+      all_txns[, n_txns_card := .N, by = Card_Number]
+
+      ## While loop to set min date
+      while(total_cards == n_cards){
+
+        # update min date
+        min_date <- new_min
+
+        new_min_data <- all_txns[all_txns$Date > min_date,]
+
+        #count number of cards in new DF
+        n_cards <- length(unique(new_min_data$Card_Number))
+
+        new_min <- min(new_min_data$Date)
+      } # end while loop
+
+
+      ## subset data to reflect new min date
+      min_txns <- all_txns[all_txns$Date >= min_date,]
+
+      ## reset n_card to number of cards in DF
+      n_cards <- length(unique(all_txns$Card_Number))
+
+      ## While loop to set max date
+      while(total_cards == n_cards){
+
+        # update max date
+        max_date <- new_max
+
+        new_max_data <- min_txns[min_txns$Date < max_date,]
+
+        #count number of cards in new DF
+        n_cards <- length(unique(new_max_data$Card_Number))
+
+        # update new max date of DF
+        new_max <- max(new_max_data$Date)
+      } # end while loop
+
+
+
+      ## Find Reverse optimized  ================-----------------------------------
+
+      ## Subset data, arranged by date
+      all_txns_rev <- txn_data_sub[txn_data_sub$loop_id == i,]
+
+      ## count cards in DF for given merchant
+      total_cards_rev <- length(unique(all_txns_rev$Card_Number))
+      n_cards_rev <- length(unique(all_txns_rev$Card_Number))
+
+      ## Set max date
+      min_date_rev <- max(all_txns_rev$Date)
+      new_min_rev <- max(all_txns_rev$Date)
+
+      max_date_rev <- min(all_txns_rev$Date)
+      new_max_rev <- min(all_txns_rev$Date)
+
+      ## While loop to set min date
+      while(total_cards_rev == n_cards_rev){
+
+        # update min date
+        min_date_rev <- new_min_rev
+
+        new_min_data_rev <- all_txns_rev[all_txns_rev$Date < min_date_rev,]
+
+        #count number of cards in new DF
+        n_cards_rev <- length(unique(new_min_data_rev$Card_Number))
+
+        new_min_rev <- max(new_min_data_rev$Date)
+      } # end while loop
+
+
+      ## subset data to reflect new min date
+      min_txns_rev <- all_txns_rev[all_txns_rev$Date <= min_date_rev,]
+
+      ## reset n_card to number of cards in DF
+      n_cards_rev <- length(unique(all_txns_rev$Card_Number))
+
+      ## While loop to set max date
+      while(total_cards_rev == n_cards_rev){
+
+        # update max date
+        max_date_rev <- new_max_rev
+
+        new_max_data_rev <- min_txns_rev[min_txns_rev$Date > max_date_rev,]
+
+        #count number of cards in new DF
+        n_cards_rev <- length(unique(new_max_data_rev$Card_Number))
+
+        # update new max date of DF
+        new_max_rev <- min(new_max_data_rev$Date)
+      } # end while loop
+
+      #choose shortest interval
+      if (difftime(min_date_rev, max_date_rev) <difftime(max_date, min_date)) {
+
+        final_data <- all_txns[all_txns$Date >= max_date_rev &
+                                 all_txns$Date <= min_date_rev,]
+
+      } else {
+        final_data <- all_txns[all_txns$Date >= min_date &
+                                       all_txns$Date <=max_date,]
+      }
+
+      ## fill matrix values
+
+      #min date
+      optimized[i, 1] <- as.character(min(final_data$Date))
+
+      #max date
+      optimized[i, 2] <- as.character(max(final_data$Date))
+
+      #date range
+      optimized[i, 3] <-as.numeric(difftime(max(final_data$Date),min(final_data$Date), c("days")))
+  }
+
+
+
+} # end for loop
+) ## end supress warnings
+
+
+## Create Final DF
+optimized_df <- setDT(as.data.frame(optimized))
+colnames(optimized_df) <- c("start_exposure_date","end_exposure_date","days_in_exposure_window")
+
+#fix data types
+optimized_df$start_exposure_date <- as.Date(optimized_df$start_exposure_date)
+optimized_df$end_exposure_date <- as.Date(optimized_df$end_exposure_date)
+optimized_df$days_in_exposure_window <- as.character(optimized_df$days_in_exposure_window)
+optimized_df$days_in_exposure_window <- as.numeric(optimized_df$days_in_exposure_window)
+
+if(data_type %in%  c("counterfeit", "pin")){
+
+cpp_table <- setDT(cbind(as.data.frame(cpp_table[,-6]), optimized_df))
+
+#get names for mid
+name_lu_cols <-c("Merchant_Name","Merchant_ID")
+mid_name_lu <- unique(txn_data[Merchant_ID %in% cpp_table$Merchant_ID, ..name_lu_cols])
+
+## select top name by mid
+setorder(mid_name_lu, Merchant_ID)
+mid_name_lu <- mid_name_lu[,.SD[1], by = Merchant_ID]
+
+## join
+setkey(mid_name_lu, Merchant_ID)
+setkey(cpp_table, Merchant_ID)
+
+final_table <- mid_name_lu[cpp_table]
+
+
+setcolorder(final_table, c("Merchant_ID", "Merchant_Name", "MCC", "n_cards",
+                           "n_total_cards_CPP", "n_txns", "start_exposure_date",
+                           "end_exposure_date", "days_in_exposure_window"))
+
+setorder(final_table, -n_cards, days_in_exposure_window)
+
+} else {
+
+  cpp_table <- setDT(cbind(as.data.frame(cpp_table[,-6]), optimized_df))
+
+  #get names for mid
+  name_lu_cols <-c("Merchant_Name","Terminal")
+  mid_name_lu <- unique(txn_data[Terminal %in% cpp_table$Terminal, ..name_lu_cols])
+
+  ## select top name by mid
+  setorder(mid_name_lu, Terminal)
+  mid_name_lu <- mid_name_lu[,.SD[1], by = Terminal]
+
+  ## join
+  setkey(mid_name_lu, Terminal)
+  setkey(cpp_table, Terminal)
+
+  final_table <- mid_name_lu[cpp_table]
+
+  setcolorder(final_table, c("Terminal", "Merchant_Name", "MCC", "n_cards",
+                             "n_total_cards_CPP", "n_txns", "start_exposure_date",
+                             "end_exposure_date", "days_in_exposure_window"))
+
+  setorder(final_table, -n_cards, days_in_exposure_window)
+}
+
+final_table
+} ## end function
+
+
